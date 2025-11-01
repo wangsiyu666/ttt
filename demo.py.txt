@@ -1,0 +1,387 @@
+"""
+risk_locator_pro_unified.py
+
+功能：
+- 支持批量处理 .pdf / .docx
+- Word: 段落级 + 多次匹配；返回 paragraph_index, start_pos, end_pos
+- PDF:
+  - 若可提取文本：使用 pdfplumber 获得字符级坐标 (x0,x1,top,bottom)
+  - 若为扫描件或 pdfplumber 无法提取：尝试使用 PP-DocLayoutV2（PaddleOCR PPStructure）做 OCR 布局分析
+- 统一输出 JSON，每条结果包含 coords_meta（unit, origin, page_render_width/height if normalized）
+- 支持并发处理（ThreadPoolExecutor）
+- 配置项：fuzzy threshold, render_dpi（用于点->像素转换）
+
+使用：
+    pip install pdfplumber python-docx rapidfuzz
+    可选（OCR）：pip install "paddleocr>=2.3.0"   （并配置 PaddlePaddle 环境）
+
+输出示例见模块 docstring 或函数注释。
+"""
+
+import os
+import re
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Any, Tuple
+
+# third-party libs
+from rapidfuzz import fuzz
+
+# pdf & word parsing libs
+import pdfplumber
+from docx import Document
+
+# Try to import PPStructure from paddleocr if available (OCR/layout model)
+try:
+    from paddleocr import PPStructure  # PP-DocLayoutV2 wrapper in paddleocr
+    PADDLE_AVAILABLE = True
+except Exception:
+    PADDLE_AVAILABLE = False
+
+
+# ----------------------------
+# Configurable constants
+# ----------------------------
+DEFAULT_THRESHOLD = 85            # RapidFuzz similarity threshold
+DEFAULT_MAX_WORKERS = 6           # 并发线程数
+DEFAULT_RENDER_DPI = 150          # 用于将 PDF points -> pixels: px = points * DPI / 72
+# PDF 点 (point) : 1 point = 1/72 inch
+
+
+# ----------------------------
+# Utility functions
+# ----------------------------
+def normalize(text: str) -> str:
+    """
+    统一归一化文本以增加匹配鲁棒性：
+    - 移除连续空白（包括换行）
+    - 去除某些标点（可视需要扩展）
+    - 小写化（若为英文可以考虑）
+    """
+    if text is None:
+        return ""
+    s = re.sub(r"\s+", "", text)
+    s = re.sub(r"[，,。；;：:、.·‘’“”\"\'()（）\[\]]+", "", s)
+    return s.strip()
+
+
+def points_to_pixels(points: float, dpi: int = DEFAULT_RENDER_DPI) -> float:
+    """
+    将 PDF points 转为像素（render DPI 下）
+    1 point = 1/72 inch；pixels = points * dpi / 72
+    """
+    return points * dpi / 72.0
+
+
+def build_char_stream_and_index(chars: List[Dict[str, Any]]) -> Tuple[str, List[int]]:
+    """
+    pdfplumber -> page.chars 返回一系列字符字典，每个 char 有 'text' 等字段。
+    构建字符串 text_stream（直接按 chars 顺序拼接），并产生 index_map:
+      text_stream[i] 对应 chars[index_map[i]] 中的字符
+
+    返回:
+      text_stream (str), index_map (List[int])
+    """
+    stream_chars = []
+    index_map = []
+    for i, c in enumerate(chars):
+        # some chars might be longer than 1-length; but pdfplumber usually char['text'] is single char
+        ch = c.get('text', '')
+        if ch is None:
+            continue
+        for _ in ch:
+            stream_chars.append(ch)
+            index_map.append(i)
+    return ''.join(stream_chars), index_map
+
+
+# ----------------------------
+# Word processing
+# ----------------------------
+def find_risk_in_word(file_path: str, ai_risk_sentences: List[str], threshold: int = DEFAULT_THRESHOLD) -> List[Dict[str, Any]]:
+    """
+    在 Word 文档中查找风险句并返回所有匹配位置（支持多次匹配）
+    输出每条记录包含：
+      - file_path, file_type='word'
+      - paragraph_index, paragraph_text, context
+      - start_pos, end_pos (字符偏移 in paragraph_text)
+      - similarity
+      - coords empty (Word 坐标需要前端结合 paragraph_index + start/end 来高亮)
+    """
+    results = []
+    doc = Document(file_path)
+    for para_index, para in enumerate(doc.paragraphs):
+        para_text = para.text or ""
+        if not para_text.strip():
+            continue
+        norm_para = normalize(para_text)
+        for risk in ai_risk_sentences:
+            norm_risk = normalize(risk)
+            score = fuzz.partial_ratio(norm_para, norm_risk)
+            if score >= threshold:
+                # 查找所有完全匹配位置（原始段落文本中）
+                matches = [m.start() for m in re.finditer(re.escape(risk), para_text)]
+                if not matches:
+                    # 若没有完全匹配，尝试用 risk 的片段（前 N 字）进行模糊定位
+                    head = risk[:10]  # 可调整为更稳健的 token 切分
+                    matches = [m.start() for m in re.finditer(re.escape(head), para_text)]
+                # 每个匹配都作为一条记录返回（支持多次出现）
+                for start in matches:
+                    end = start + len(risk)
+                    results.append({
+                        "file_path": file_path,
+                        "file_type": "word",
+                        "paragraph_index": para_index,
+                        "risk_sentence": risk,
+                        "start_pos": start,
+                        "end_pos": end,
+                        "similarity": score,
+                        "context": para_text[:300],
+                        # coords_meta: word 不包含页面坐标，前端应根据 paragraph_index 做跳转并高亮字符范围
+                        "coords": None,
+                        "coords_meta": {"unit": None, "origin": None}
+                    })
+    return results
+
+
+# ----------------------------
+# PDF parsing using pdfplumber (text-extractable PDFs)
+# ----------------------------
+def find_risk_in_pdf(file_path: str, ai_risk_sentences: List[str], threshold: int = DEFAULT_THRESHOLD, render_dpi: int = DEFAULT_RENDER_DPI) -> List[Dict[str, Any]]:
+    """
+    使用 pdfplumber 提取字符并构建字符流以进行多次精确匹配。
+    返回每条匹配包括：
+      - page_number (1-based)
+      - coords: 原始 pdfplumber 单位 (points) 的 {x0, y0, x1, y1} (origin: top-left)
+      - coords_meta: unit='pt', origin='top-left' (pdfplumber 的 top 是相对页面 top 的)
+      - normalized_coords_px: coords 转换为 pixels (unit='px', origin='top-left')，用于前端渲染（以 render_dpi 为准）
+    注意：pdfplumber 的字符顺序依赖页面的内部顺序（通常是阅读顺序），在某些复杂布局下可能错位。
+    """
+    results = []
+    with pdfplumber.open(file_path) as pdf:
+        for page_num, page in enumerate(pdf.pages, start=1):
+            # 读取 page.chars（字符级布局信息）
+            chars = page.chars  # 每个 char: {'text':..., 'x0':..., 'x1':..., 'top':..., 'bottom':...}
+            if not chars:
+                continue
+            text_stream, index_map = build_char_stream_and_index(chars)
+            if not text_stream:
+                continue
+
+            # page_text for context (pdfplumber.extract_text may join with newlines)
+            page_text = page.extract_text() or ""
+
+            norm_page_text = normalize(page_text)
+            for risk in ai_risk_sentences:
+                norm_risk = normalize(risk)
+                score = fuzz.partial_ratio(norm_page_text, norm_risk)
+                # 如果页内语义相似度低，可以提前跳过（提高效率）
+                if score < threshold:
+                    continue
+
+                # 在字符流中查找所有匹配位置（基于原始风险句精确字面匹配）
+                try:
+                    # 注意：risk 里可能含有特殊 regex 字符，使用 re.escape
+                    matches = [m.start() for m in re.finditer(re.escape(risk), text_stream)]
+                except re.error:
+                    matches = []
+
+                # 若没有字面匹配，也尝试用 risk.head 来定位（容错）
+                if not matches:
+                    head = risk[:10]
+                    matches = [m.start() for m in re.finditer(re.escape(head), text_stream)]
+
+                for match_start in matches:
+                    match_end = match_start + len(risk)
+                    # 将 text_stream 索引映射到 chars 索引
+                    char_indices = index_map[match_start:match_end]
+                    if not char_indices:
+                        continue
+                    # 对应的字符块集合
+                    group_chars = [chars[i] for i in char_indices]
+                    # 计算 bbox（以 pdfplumber 的 top/bottom/x0/x1 为准）
+                    x0 = min(c['x0'] for c in group_chars)
+                    x1 = max(c['x1'] for c in group_chars)
+                    y0 = min(c['top'] for c in group_chars)      # pdfplumber top: distance from top of page (points)
+                    y1 = max(c['bottom'] for c in group_chars)   # bottom: distance from top as well
+
+                    # 原始坐标单位为 points（PDF point, 1/72 inch），origin: top-left (pdfplumber's top is measured from top)
+                    coords_pt = {"x0": x0, "y0": y0, "x1": x1, "y1": y1}
+                    coords_meta_pt = {"unit": "pt", "origin": "top-left"}  # 标注单位与原点
+
+                    # 同时计算像素单位下的坐标（方便前端在 canvas 上直接绘制）
+                    coords_px = {
+                        "x0": points_to_pixels(x0, render_dpi),
+                        "y0": points_to_pixels(y0, render_dpi),
+                        "x1": points_to_pixels(x1, render_dpi),
+                        "y1": points_to_pixels(y1, render_dpi)
+                    }
+                    coords_meta_px = {"unit": "px", "origin": "top-left", "render_dpi": render_dpi}
+
+                    results.append({
+                        "file_path": file_path,
+                        "file_type": "pdf",
+                        "page_number": page_num,
+                        "risk_sentence": risk,
+                        "start_pos": match_start,
+                        "end_pos": match_end,
+                        "similarity": score,
+                        "coords": coords_pt,
+                        "coords_meta": coords_meta_pt,
+                        "coords_normalized_px": coords_px,
+                        "coords_normalized_meta": coords_meta_px,
+                        "context": page_text[:400]
+                    })
+    return results
+
+
+# ----------------------------
+# OCR mode using PP-DocLayoutV2 (PaddleOCR's PPStructure)
+# ----------------------------
+def find_risk_in_pdf_ocr(file_path: str, ai_risk_sentences: List[str], threshold: int = DEFAULT_THRESHOLD, render_dpi: int = DEFAULT_RENDER_DPI) -> List[Dict[str, Any]]:
+    """
+    针对扫描件 PDF 使用 PP-DocLayoutV2（通过 paddleocr.PPStructure）：
+      - PPStructure(file_path) 返回若干 blocks，block 包含 text,bbox,page_no 等
+      - bbox 格式通常是 [x0,y0,x1,y1] 且以图像像素为单位（origin=top-left）
+    输出：
+      - coords: 原始 bbox（unit='px', origin='top-left'，基于 OCR 输入图像尺寸）
+      - coords_normalized_px: 如上（只是复用）
+    注意：
+      - 需要安装 paddleocr + paddlepaddle；没有安装时该函数不会被调用（上层有 try/except）
+    """
+    if not PADDLE_AVAILABLE:
+        raise RuntimeError("PP-DocLayoutV2 (PaddleOCR) not available. Install paddleocr and paddlepaddle to use OCR mode.")
+
+    results = []
+    # 初始化 PPStructure（参数可按需调整）
+    structure = PPStructure(show_log=False, layout=True, ocr=True, image_orientation=True)
+    # 运行结构化分析，返回 block 列表
+    ocr_blocks = structure(file_path)  # 每个 block 例子: {'text': '...', 'bbox': [x0,y0,x1,y1], 'page_no': 1, ...}
+
+    for block in ocr_blocks:
+        text = block.get('text', '') or ''
+        if not text.strip():
+            continue
+        norm_block = normalize(text)
+        for risk in ai_risk_sentences:
+            norm_risk = normalize(risk)
+            score = fuzz.partial_ratio(norm_block, norm_risk)
+            if score < threshold:
+                continue
+            bbox = block.get('bbox')
+            page_no = block.get('page_no', 1)
+            if not bbox or len(bbox) != 4:
+                continue
+            # bbox: [x0,y0,x1,y1] (pixels) origin typically top-left
+            coords_px = {"x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3]}
+            coords_meta_px = {"unit": "px", "origin": "top-left", "ocr": "pp-doclayout-v2"}
+
+            results.append({
+                "file_path": file_path,
+                "file_type": "pdf_ocr",
+                "page_number": page_no,
+                "risk_sentence": risk,
+                "similarity": score,
+                "coords": coords_px,
+                "coords_meta": coords_meta_px,
+                "coords_normalized_px": coords_px,  # already px
+                "coords_normalized_meta": coords_meta_px,
+                "context": text[:300]
+            })
+    return results
+
+
+# ----------------------------
+# file-level dispatcher + concurrency
+# ----------------------------
+def process_file(file_path: str, ai_risk_sentences: List[str], threshold: int = DEFAULT_THRESHOLD, render_dpi: int = DEFAULT_RENDER_DPI) -> List[Dict[str, Any]]:
+    """
+    根据文件后缀调度处理：
+      - .docx -> find_risk_in_word
+      - .pdf  -> 优先 pdfplumber 方法；若 pdfplumber 字符流提取失败或检测到为扫描件（无 chars），则 fallback 到 OCR (PP-DocLayoutV2)
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+    try:
+        if ext == ".docx":
+            return find_risk_in_word(file_path, ai_risk_sentences, threshold)
+        elif ext == ".pdf":
+            try:
+                # 尝试普通 PDF 文本解析
+                pdf_res = find_risk_in_pdf(file_path, ai_risk_sentences, threshold, render_dpi)
+                # 若 pdfplumber 没有任何匹配，同时 page.chars 很少，可能是扫描件 -> 尝试 OCR
+                if not pdf_res and PADDLE_AVAILABLE:
+                    # 额外检测是否为扫描页：快速 heuristic：判断第一页 chars 是否为空或极少
+                    with pdfplumber.open(file_path) as pdf:
+                        first_page_has_chars = any(pdf.pages[0].chars) if pdf.pages else False
+                    if not first_page_has_chars:
+                        # fallback to OCR
+                        ocr_res = find_risk_in_pdf_ocr(file_path, ai_risk_sentences, threshold, render_dpi)
+                        return ocr_res
+                return pdf_res
+            except Exception as e:
+                # 若 pdfplumber 抛异常，尝试 OCR 分析（如果可用）
+                if PADDLE_AVAILABLE:
+                    return find_risk_in_pdf_ocr(file_path, ai_risk_sentences, threshold, render_dpi)
+                else:
+                    # 返回空并记录错误信息（调用方可根据需要记录日志）
+                    print(f"[WARN] pdf parsing failed for {file_path}: {e}")
+                    return []
+        else:
+            return []
+    except Exception as e:
+        print(f"[ERROR] processing {file_path} failed: {e}")
+        return []
+
+
+def batch_process_contracts(file_list: List[str], ai_risk_sentences: List[str], threshold: int = DEFAULT_THRESHOLD, render_dpi: int = DEFAULT_RENDER_DPI, max_workers: int = DEFAULT_MAX_WORKERS) -> List[Dict[str, Any]]:
+    """
+    并发批量处理文件列表，返回统一的 JSON 结构数组
+    """
+    all_results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_to_file = {ex.submit(process_file, f, ai_risk_sentences, threshold, render_dpi): f for f in file_list}
+        for fut in as_completed(future_to_file):
+            file = future_to_file[fut]
+            try:
+                res = fut.result()
+                if res:
+                    all_results.extend(res)
+            except Exception as e:
+                print(f"[ERROR] file {file} processing raised: {e}")
+    return all_results
+
+
+# ----------------------------
+# Example and local verification helpers
+# ----------------------------
+def save_results_to_json(results: List[Dict[str, Any]], out_path: str = "risk_results_unified.json"):
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    print(f"[INFO] saved {len(results)} results to {out_path}")
+
+
+# ----------------------------
+# If run as script -> demo usage (not a unit test, just a run example)
+# ----------------------------
+if __name__ == "__main__":
+    # Example AI-detected risk sentences (来自 LLM 的输出)
+    ai_risk_sentences = [
+        "若一方违约，另一方有权解除合同并要求赔偿损失。",
+        "乙方应在收到货物后五日内完成验收。",
+        "合同履行过程中如遇不可抗力，应及时通知对方。"
+    ]
+
+    # Example files - 替换为你本地真实路径
+    contract_dir = "./contracts_example"
+    # collect .pdf and .docx in directory (示例)
+    files = []
+    for fname in os.listdir(contract_dir) if os.path.isdir(contract_dir) else []:
+        if fname.lower().endswith((".pdf", ".docx")):
+            files.append(os.path.join(contract_dir, fname))
+
+    # 若没有目录，示例用列表示例（请替换为真实文件）
+    if not files:
+        files = ["contract1.pdf", "contract2.docx", "contract3_scanned.pdf"]
+
+    results = batch_process_contracts(files, ai_risk_sentences, threshold=85, render_dpi=150, max_workers=6)
+    save_results_to_json(results, "risk_results_unified.json")
