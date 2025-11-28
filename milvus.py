@@ -192,26 +192,12 @@ class MilvusRetriever(Retriever):
         self._embedding_dim = self.embedding_function.encode_documents(["wsy"])[0].shape[0]
         self.n_results = TOP_N
         self._create_collections()
-        self.milvus_client: Any = None  # lazily
-        # self.milvus_client = MilvusClient(uri=DEFAULT_MILVUS_URI)
-        # self.milvus_client = LangchainMilvus(
-        #     embedding_function=self.embedding_function,
-        #     collection_name=self.collection_name,
-        #     connection_args={
-        #         "uri": self.uri,
-        #         "user": self.user,
-        #         "password": self.password,
-        #     },
-        #     drop_old=False,
-        # )
-
-    def _connect(self) -> None:
         connection_args = {
             "uri": DEFAULT_MILVUS_URI,
             "user": DEFAULT_USER,
             "password": DEFAULT_PWD
         }
-        self.client = LangchainMilvus(
+        self.milvus_client = LangchainMilvus(
             embedding_function=self.embedding_function,
             collection_name=DEFAULT_COLLECTION,
             connection_args=connection_args,
@@ -417,6 +403,9 @@ class MilvusRetriever(Retriever):
             else:
                 # LangChain Milvus API
                 docs: Iterable[Any] = self.milvus_client.similarity_search()
+                # todo
+        except Exception as e:
+            # todo
 
     def _is_milvus_lite(self) -> bool:
         return DEFAULT_MILVUS_URI.endswith(".db") or (
