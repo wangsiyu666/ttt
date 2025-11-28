@@ -174,6 +174,9 @@ class QwenEmbedding(EmbeddingBase):
 
 # DEFAULT_MILVUS_URI = "./milvus.db"
 DEFAULT_MILVUS_URI = "http://192.168.124.137:19530"
+DEFAULT_USER = ""
+DEFAULT_PWD = ""
+DEFAULT_COLLECTION = "test"
 """
 L2: 欧几里得
 IP: 点积
@@ -184,12 +187,13 @@ TOP_N = 10
 
 class MilvusRetriever(Retriever):
     def __init__(self):
-        self.milvus_client = MilvusClient(uri=DEFAULT_MILVUS_URI)
         self.metric_type = METRIC_TYPE
         self.embedding_function = QwenEmbedding()
         self._embedding_dim = self.embedding_function.encode_documents(["wsy"])[0].shape[0]
         self.n_results = TOP_N
         self._create_collections()
+        self.milvus_client: Any = None  # lazily
+        # self.milvus_client = MilvusClient(uri=DEFAULT_MILVUS_URI)
         # self.milvus_client = LangchainMilvus(
         #     embedding_function=self.embedding_function,
         #     collection_name=self.collection_name,
@@ -201,6 +205,19 @@ class MilvusRetriever(Retriever):
         #     drop_old=False,
         # )
 
+    def _connect(self) -> None:
+        connection_args = {
+            "uri": DEFAULT_MILVUS_URI,
+            "user": DEFAULT_USER,
+            "password": DEFAULT_PWD
+        }
+        self.client = LangchainMilvus(
+            embedding_function=self.embedding_function,
+            collection_name=DEFAULT_COLLECTION,
+            connection_args=connection_args,
+            drop_old=False
+        )
+
     def _create_collections(self):
         self._create_default_collections("default")
         self._create_test_collections("test")
@@ -210,6 +227,7 @@ class MilvusRetriever(Retriever):
         return self.embedding_function.encode_documents(data).tolist()
 
     def _create_default_collections(self, name: str):
+        self._connect()
         if not self.milvus_client.has_collection(collection_name=name):
             default_schema = MilvusClient.create_schema(
                 auto_id=False,
@@ -327,35 +345,19 @@ class MilvusRetriever(Retriever):
             metadata: Dict[str, Any],
     ) -> None:
         try:
-            embedding = self.embedding_function.encode_documents(content)
-            if self._is_milvus_lite():
-                data = [
+            self.milvus_client.add_texts(
+                texts=[content],
+                metadatas=[
                     {
                         "id": doc_id,
-                        "embedding": embedding,
-                        "content": content,
                         "title": title,
                         "url": url,
                         **metadata
                     }
-                ]
-                self.milvus_client.insert(collection_name="test", data=data)
-            else:
-                # LangChain Milvus API
-                self.milvus_client.add_texts(
-                    texts=[content],
-                    metadatas=[
-                        {
-                            "id": doc_id,
-                            "title": title,
-                            "url": url,
-                            **metadata
-                        }
-                    ],
-                )
+                ],
+            )
         except Exception as e:
             raise RuntimeError(f"Failed to add test: {e}")
-
 
     # todo add_custom
 
